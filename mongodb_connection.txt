@@ -1,0 +1,13 @@
+# Copy this content to create a .env file in the WEBSCRAPPING-NEW directory
+
+MONGODB_URL=mongodb+srv://qasim:<db_password>@cluster0.x60ytnz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
+DATABASE_NAME=webscraping_db
+
+# Instructions:
+# 1. Create a file named ".env" in the WEBSCRAPPING-NEW directory
+# 2. Copy the above content to the .env file
+# 3. Replace <db_password> with your actual MongoDB Atlas password
+# 4. Save the file
+
+# Example with actual password:
+# MONGODB_URL=mongodb+srv://qasim:your_actual_password@cluster0.x60ytnz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
