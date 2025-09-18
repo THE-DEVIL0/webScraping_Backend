@@ -4,6 +4,7 @@ app/routers/__pycache__/
 image_processing__pycache__/
 scrappers/__pycache__/
 utils/__pycache__/
+.env
 *.log
 *.json
 images/
