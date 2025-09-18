@@ -1,0 +1,11 @@
+__pycache__/
+app/__pycache__/
+app/routers/__pycache__/
+image_processing__pycache__/
+scrappers/__pycache__/
+utils/__pycache__/
+*.log
+*.json
+images/
+*.pb
+*.md
