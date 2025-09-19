@@ -27,7 +27,7 @@ class DownloadZipRequest(BaseModel):
 @router.post("/amazon", response_model=ScrapeResponse)
 async def scrape_amazon_endpoint(req: ScrapeRequest):
     try:
-        logger.info(f"Scraping amazon with URL {req.url}")
+        logger.info(f"Scraping amazon with URL {req.url}   max_products {req.max_products} ")
         stats = await scrape_amazon(str(req.url), max_products=req.max_products, headless=req.headless, driver_type=req.driver_type)
         return ScrapeResponse(**stats)
     except Exception as e:

@@ -53,10 +53,12 @@ async def generation_generate(req: GenerationRequest):
 
         output_urls = await generate_background(
             req.prompt,
-            req.negative_prompt,
-            req.num_images,
             req.size,
-            req.quality
+            req.quality,
+            req.num_images,
+            req.negative_prompt,
+            
+           
         )
 
         logger.info(f"Generated {len(output_urls)} images for task {task_id}")
@@ -94,7 +96,13 @@ async def merge_background(req: MergeRequest):
             "created_at": datetime.now(timezone.utc),
             "input_urls": [str(req.foreground_url), str(req.background_url)],
             "output_urls": [],
-            "metadata": {"preview_mode": req.preview_mode}
+            "metadata": {
+                "preview_mode": req.preview_mode,
+                "foreground_scale": req.foreground_scale,
+                "background_scale": req.background_scale,
+                "position_x": req.position_x,
+                "position_y": req.position_y
+            }
         })
 
         # Fetch images to BytesIO
@@ -126,23 +134,28 @@ async def merge_background(req: MergeRequest):
         if not req.preview_mode:
             logger.info("Uploading merged image to Cloudinary")
             try:
-                upload = cloudinary.uploader.upload(merged, folder="merged", resource_type="image")
+                upload = cloudinary.uploader.upload(
+                    merged,
+                    folder="merged",
+                    resource_type="image",
+                    overwrite=True
+                )
                 output_urls.append(upload["secure_url"])
                 logger.info(f"Uploaded to Cloudinary: {upload['secure_url']}")
-                merged.seek(0)  # Reset buffer for potential reuse
+                merged.seek(0)
             except Exception as e:
                 logger.error(f"Cloudinary upload failed: {str(e)}")
-                raise
+                raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {str(e)}")
         else:
             logger.info("Converting merged image to base64 for preview")
             try:
                 merged.seek(0)
                 merged_base64 = base64.b64encode(merged.getvalue()).decode()
-                merged = f"data:image/png;base64,{merged_base64}"
+                merged_url = f"data:image/png;base64,{merged_base64}"
                 logger.info("Base64 encoding successful")
             except Exception as e:
                 logger.error(f"Base64 encoding failed: {str(e)}")
-                raise
+                raise HTTPException(status_code=500, detail=f"Base64 encoding failed: {str(e)}")
 
         logger.info(f"Updating task {task_id} to completed")
         await tasks_collection.update_one(
@@ -151,17 +164,33 @@ async def merge_background(req: MergeRequest):
                 "status": "completed",
                 "output_urls": output_urls,
                 "completed_at": datetime.now(timezone.utc),
-                "metadata": {"preview_mode": req.preview_mode}
+                "metadata": {
+                    "preview_mode": req.preview_mode,
+                    "output_size": merged.getbuffer().nbytes / 1024**2
+                }
             }}
         )
 
         logger.info(f"Returning MergeResponse with merged_image: {'base64' if req.preview_mode else output_urls[0]}")
-        return MergeResponse(status="success", merged_image=output_urls[0] if output_urls else merged)
+        return MergeResponse(status="success", merged_image=output_urls[0] if output_urls else merged_url)
 
+    except HTTPException as e:
+        logger.error(f"Merge task {task_id} failed: {e.status_code}: {e.detail}")
+        await tasks_collection.update_one(
+            {"task_id": task_id},
+            {"$set": {
+                "status": "error",
+                "metadata": {"error": e.detail, "status_code": e.status_code}
+            }}
+        )
+        raise  # Re-raise HTTPException to preserve status code
     except Exception as e:
         logger.error(f"Merge task {task_id} failed: {str(e)}")
         await tasks_collection.update_one(
             {"task_id": task_id},
-            {"$set": {"status": "error", "metadata": {"error": str(e)}}}
+            {"$set": {
+                "status": "error",
+                "metadata": {"error": str(e)}
+            }}
         )
         raise HTTPException(status_code=500, detail=f"Merge failed: {str(e)}")

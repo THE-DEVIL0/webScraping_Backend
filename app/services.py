@@ -26,7 +26,15 @@ from models import BackgroundRemovalTask
 import uuid
 from cloudinary_config import upload_to_cloudinary  # Added for Cloudinary uploadfrom datetime import datetime
 from datetime import datetime
-
+import numpy as np
+import cv2
+from pathlib import Path
+from typing import List
+from pydantic.networks import HttpUrl
+from io import BytesIO
+import logging
+import gc
+import psutil  # Added for memory monitoring
 
 
 # Configure logging
@@ -40,6 +48,7 @@ logger = logging.getLogger(__name__)
 # Initialize BackgroundGenerator with OpenAI API key
 from config import OPENAI_API_KEY
 generator = BackgroundGenerator(api_key=OPENAI_API_KEY, model_name="dall-e-3")
+
 
 async def _download_image_to_temp(url: HttpUrl) -> Optional[str]:
     """Download an image from a URL to a temporary file asynchronously."""
@@ -67,28 +76,48 @@ async def _download_image_to_temp(url: HttpUrl) -> Optional[str]:
         print(f"_download_image_to_temp: Failed for {url}, returned None")
         return None
 
+
     
-async def _fetch_image_to_bytes(url: HttpUrl) -> Optional[BytesIO]:
+async def _fetch_image_to_bytes(url: str) -> BytesIO:
     """Fetch an image from a URL to a BytesIO object asynchronously."""
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(str(url), timeout=10)
-            if response.status_code != 200:
-                logger.error(f"Failed to fetch {url}: HTTP {response.status_code}")
-                print(f"_fetch_image_to_bytes: Failed for {url}, HTTP {response.status_code}, returned None")
-                return None
-            image_bytes = BytesIO(response.content)
-            print(f"_fetch_image_to_bytes: Fetched {url} to BytesIO")
-            return image_bytes
+        url_str = str(url)
+        logger.info(f"Fetching image from URL: {url_str}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_str, timeout=30) as resp:  # Increased timeout to 30s
+                logger.info(f"Response status for {url_str}: {resp.status}")
+                if resp.status != 200:
+                    logger.error(f"Failed to fetch {url_str}: HTTP {resp.status}")
+                    return None
+                # Check content length
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > 50 * 1024 * 1024:  # 50MB limit
+                    logger.error(f"Image too large: {url_str} ({content_length} bytes)")
+                    return None
+                content = await resp.read()
+                logger.info(f"Successfully fetched {len(content)} bytes from {url_str}")
+                logger.debug(f"Response headers: {dict(resp.headers)}")
+                return BytesIO(content)
+    except aiohttp.ClientConnectionError as e:
+        logger.error(f"Connection error fetching {url_str}: {str(e)}")
+        return None
+    except aiohttp.ClientResponseError as e:
+        logger.error(f"Response error fetching {url_str}: {str(e)}")
+        return None
+    except asyncio.TimeoutError as e:
+        logger.error(f"Timeout fetching {url_str}: {str(e)}")
+        return None
     except Exception as e:
-        logger.error(f"Failed to fetch {url}: {e}")
-        print(f"_fetch_image_to_bytes: Failed for {url}, error: {e}, returned None")
+        logger.error(f"Unexpected error fetching {url_str}: {type(e).__name__}: {str(e)}")
         return None
 
-async def remove_background(image_urls: List[HttpUrl], add_white_bg: bool = False) -> Dict:
-    task_id = str(uuid.uuid4())
+# app/services.py
+# app/services.py
+async def remove_background(image_urls: List[HttpUrl], add_white_bg: bool = False, task_id: str = None) -> Dict:
+    task_id = task_id or str(uuid.uuid4())  # ✅ Use provided task_id or generate new
     logger.info(f"Starting background removal task {task_id} with URLs: {image_urls}")
     print(f"remove_background: Starting task {task_id} with image_urls: {image_urls}")
+
 
     # Create DB task
     task = BackgroundRemovalTask(
@@ -101,12 +130,15 @@ async def remove_background(image_urls: List[HttpUrl], add_white_bg: bool = Fals
 
     try:
         db = get_database()
-        if db:
+        if db is not None:  # ✅ Fix: Use explicit None check
             task_dict = task.model_dump(by_alias=True)
             task_dict['input_urls'] = [str(url) for url in task_dict['input_urls']]
             await db.background_removal_tasks.insert_one(task_dict)
             logger.info(f"Background removal task {task_id} created in database")
             print(f"remove_background: Task {task_id} inserted into database")
+        else:
+            logger.warning(f"Database connection is None for task {task_id}")
+            print(f"remove_background: Database connection is None for task {task_id}")
     except Exception as e:
         logger.error(f"Failed to save task {task_id} to database: {e}")
         print(f"remove_background: Failed to insert task {task_id} to database: {e}")
@@ -145,7 +177,6 @@ async def remove_background(image_urls: List[HttpUrl], add_white_bg: bool = Fals
             continue
 
         try:
-            # Always upload via temp file
             cloud_url = await upload_to_cloudinary(processed_image_bytes, folder="background_removal")
             if cloud_url:
                 cloud_urls.append(cloud_url)
@@ -164,7 +195,8 @@ async def remove_background(image_urls: List[HttpUrl], add_white_bg: bool = Fals
 
     # Update DB with results
     try:
-        if db:
+        db = get_database()  # Re-fetch in case connection dropped
+        if db is not None:  # ✅ Fix: Use explicit None check
             update_dict = {
                 "status": "completed",
                 "output_urls": [str(url) for url in cloud_urls],
@@ -179,6 +211,9 @@ async def remove_background(image_urls: List[HttpUrl], add_white_bg: bool = Fals
             )
             logger.info(f"Background removal task {task_id} completed and saved to database")
             print(f"remove_background: Task {task_id} updated in database")
+        else:
+            logger.warning(f"Database connection is None for task {task_id} update")
+            print(f"remove_background: Database connection is None for task {task_id} update")
     except Exception as e:
         logger.error(f"Failed to update task {task_id} in database: {e}")
         print(f"remove_background: Failed to update task {task_id} in database: {e}")
@@ -307,10 +342,12 @@ def scrape_shopify(url: str, max_products: Optional[int] = None) -> Dict:
 
 async def generate_background(
     prompt: str,
-    negative_prompt: Optional[str] = None,
+    size: str ,
+    quality: str ,
     num_images: int = 1,
-    size: str = "1024x1024",
-    quality: str = "standard"
+    negative_prompt: Optional[str] = None,
+    
+  
 ) -> List[HttpUrl]:
     try:
         image_bytes_list = generator.generate(
@@ -372,7 +409,7 @@ async def optimize_images(
         return []
 
     optimized_urls = []
-    output_dir = Path("images") / "optimized"  # ✅ Kept for logging, not used for storage
+    output_dir = Path("images") / "optimized"  # Kept for logging, not used for storage
 
     # Load super-res model
     sr = None
@@ -387,7 +424,7 @@ async def optimize_images(
             upscale = False
         else:
             try:
-                sr = DnnSuperResImpl_create()
+                sr = cv2.dnn_superres.DnnSuperResImpl_create()
                 sr.readModel(str(model_path))
                 sr.setModel("edsr", 4)
                 logger.info("Super-resolution model loaded successfully.")
@@ -399,6 +436,11 @@ async def optimize_images(
     failed_count = 0
     for url, image_bytes in image_objects:
         try:
+            # Log memory usage before processing
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            logger.info(f"Memory usage before processing {url}: {mem_info.rss / 1024**2:.2f} MB")
+
             # Load image from BytesIO
             image_bytes.seek(0)
             img_array = np.frombuffer(image_bytes.getvalue(), dtype=np.uint8)
@@ -411,6 +453,16 @@ async def optimize_images(
             h, w = img.shape[:2]
             has_alpha = len(img.shape) == 3 and img.shape[2] == 4
 
+            # Check image size to avoid memory issues
+            MAX_PIXELS = 4000 * 4000  # Limit to 4K resolution
+            if h * w > MAX_PIXELS:
+                logger.warning(f"Image from {url} too large ({w}x{h}). Downscaling to fit {MAX_PIXELS} pixels.")
+                scale_factor = (MAX_PIXELS / (h * w)) ** 0.5
+                new_w, new_h = int(w * scale_factor), int(h * scale_factor)
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                h, w = img.shape[:2]
+                logger.info(f"Downscaled image from {url} to {w}x{h}")
+
             # Handle alpha
             if has_alpha:
                 alpha = img[:, :, 3]
@@ -420,12 +472,23 @@ async def optimize_images(
 
             # 1. Upscale
             if upscale and sr is not None:
-                img_upscaled = sr.upsample(img_bgr)
-                img_upscaled = cv2.bilateralFilter(img_upscaled, 3, 30, 30)
-                laplacian_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]) * 0.7
-                img_upscaled = cv2.filter2D(img_upscaled, -1, laplacian_kernel)
-                img_bgr = img_upscaled
-                logger.info(f"Upscaled image from {url} from {w}x{h} to {img_bgr.shape[1]}x{img_bgr.shape[0]}")
+                # Skip upscaling for large images to prevent memory issues
+                if h * w * 16 > MAX_PIXELS:  # Upscaling by 4x increases pixels by 16x
+                    logger.warning(f"Skipping upscale for {url} due to large size ({w}x{h}).")
+                else:
+                    try:
+                        img_upscaled = sr.upsample(img_bgr)
+                        img_upscaled = cv2.bilateralFilter(img_upscaled, 3, 30, 30)
+                        laplacian_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]) * 0.7
+                        img_upscaled = cv2.filter2D(img_upscaled, -1, laplacian_kernel)
+                        img_bgr = img_upscaled
+                        logger.info(f"Upscaled image from {url} from {w}x{h} to {img_bgr.shape[1]}x{img_bgr.shape[0]}")
+                    except cv2.error as e:
+                        logger.error(f"Upscaling failed for {url}: {e}. Skipping upscaling.")
+                        upscale = False  # Disable upscaling for this image
+                    finally:
+                        del img_upscaled  # Free memory
+                        gc.collect()
 
             # 2. Denoise
             if denoise:
@@ -451,6 +514,8 @@ async def optimize_images(
                         0, 255
                     )
                 img_bgr = dehazed.astype(np.uint8)
+                del dark_channel, transmission, dehazed  # Free memory
+                gc.collect()
             elif enhance_lighting and has_alpha:
                 gamma = 1.1
                 inv_gamma = 1.0 / gamma
@@ -478,10 +543,12 @@ async def optimize_images(
                 unsharp = cv2.addWeighted(img_bgr, 2.5, gaussian, -1.5, 0)
                 sharpen_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]]) * 0.4
                 img_bgr = cv2.addWeighted(unsharp, 1.0, cv2.filter2D(unsharp, -1, sharpen_kernel), 0.6, 0)
+                del lab, l, a, b, cl, channels, gaussian, unsharp  # Free memory
+                gc.collect()
 
             # Re-attach alpha
             if has_alpha:
-                if upscale and sr is not None:
+                if upscale and sr is not None and h * w * 16 <= MAX_PIXELS:
                     alpha = cv2.resize(alpha, (img_bgr.shape[1], img_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
                 img_final = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGBA)
                 img_final[:, :, 3] = alpha
@@ -506,6 +573,20 @@ async def optimize_images(
                 logger.error(f"Failed to upload optimized image from {url} to Cloudinary")
                 failed_count += 1
 
+            # Clean up
+            del img, img_bgr, img_final, output_buffer
+            if has_alpha:
+                del alpha
+            gc.collect()
+
+            # Log memory usage after processing
+            mem_info = process.memory_info()
+            logger.info(f"Memory usage after processing {url}: {mem_info.rss / 1024**2:.2f} MB")
+
+        except MemoryError as e:
+            logger.error(f"MemoryError optimizing image from {url}: {e}")
+            failed_count += 1
+            continue
         except Exception as e:
             logger.error(f"Error optimizing image from {url}: {e}")
             failed_count += 1
@@ -513,6 +594,7 @@ async def optimize_images(
 
     logger.info(f"Optimized {len(image_objects)} images: {len(optimized_urls)} success, {failed_count} failed.")
     return optimized_urls
+
 
 
 async def merge_images(

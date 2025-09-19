@@ -14,6 +14,7 @@ async def background_health():
     logger.info("Health check endpoint called for background removal")
     return {"status": "ok"}
 
+# app/background.py
 @router.post("/remove", response_model=BackgroundRemovalResponse)
 async def remove_background_endpoint(req: BackgroundRemovalRequest):
     task_id = str(uuid.uuid4())
@@ -21,8 +22,8 @@ async def remove_background_endpoint(req: BackgroundRemovalRequest):
     print(f"background.py: Received image_urls: {req.image_urls}")
 
     try:
-        # Delegate to services.remove_background
-        result = await remove_background(req.image_urls, add_white_bg=req.add_white_bg)
+        # Delegate to services.remove_background, passing task_id
+        result = await remove_background(req.image_urls, add_white_bg=req.add_white_bg, task_id=task_id)  # ✅ Pass task_id
         logger.info(f"[{task_id}] Background removal result: {result}")
         print(f"background.py: Result from remove_background: {result}")
 
@@ -39,19 +40,24 @@ async def remove_background_endpoint(req: BackgroundRemovalRequest):
         # Update task status to error
         try:
             tasks_collection = get_db_collection("background_removal_tasks")
-            await tasks_collection.update_one(
-                {"task_id": task_id},
-                {
-                    "$set": {
-                        "status": "error",
-                        "completed_at": datetime.now(timezone.utc).isoformat(),
-                        "metadata": {"error": str(e)}
+            if tasks_collection is not None:  # ✅ Fix: Use explicit None check
+                await tasks_collection.update_one(
+                    {"task_id": task_id},
+                    {
+                        "$set": {
+                            "status": "error",
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
+                            "metadata": {"error": str(e)}
+                        }
                     }
-                }
-            )
+                )
+            else:
+                logger.warning(f"Database connection is None for task {task_id} error update")
         except Exception as db_e:
             logger.error(f"[{task_id}] Failed to update task status to error: {db_e}")
         raise HTTPException(status_code=500, detail=f"Background removal failed: {str(e)}")
+    
+    
 
 @router.get("/tasks")
 async def get_background_tasks():
